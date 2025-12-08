@@ -21,17 +21,29 @@ variable "app_name" {
   default = "react-hello-world"
 }
 
+variable "instance_type" {
+  default = "t3.micro"
+}
+
 variable "app_port" {
   default = 3000
 }
 
-variable "container_port" {
-  default = 3000
+variable "ami_id" {
+  description = "AMI ID de tu imagen personalizada con Docker"
+  type        = string
 }
 
-variable "container_image" {
-  description = "Docker image URI from ECR"
-  type        = string
+variable "desired_capacity" {
+  default = 2
+}
+
+variable "min_size" {
+  default = 2
+}
+
+variable "max_size" {
+  default = 4
 }
 
 # VPC
@@ -133,17 +145,24 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# Security Group para ECS
-resource "aws_security_group" "ecs" {
-  name        = "${var.app_name}-ecs-sg"
-  description = "Security group for ECS"
+# Security Group para EC2
+resource "aws_security_group" "ec2" {
+  name        = "${var.app_name}-ec2-sg"
+  description = "Security group for EC2 instances"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port       = var.container_port
-    to_port         = var.container_port
+    from_port       = var.app_port
+    to_port         = var.app_port
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -154,7 +173,7 @@ resource "aws_security_group" "ecs" {
   }
 
   tags = {
-    Name = "${var.app_name}-ecs-sg"
+    Name = "${var.app_name}-ec2-sg"
   }
 }
 
@@ -174,10 +193,10 @@ resource "aws_lb" "main" {
 # Target Group
 resource "aws_lb_target_group" "main" {
   name        = "${var.app_name}-tg"
-  port        = var.container_port
+  port        = var.app_port
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
-  target_type = "ip"
+  target_type = "instance"
 
   health_check {
     healthy_threshold   = 2
@@ -205,141 +224,167 @@ resource "aws_lb_listener" "main" {
   }
 }
 
-# CloudWatch Log Group
-resource "aws_cloudwatch_log_group" "ecs" {
-  name              = "/ecs/${var.app_name}"
-  retention_in_days = 7
+# Launch Template para Auto Scaling
+resource "aws_launch_template" "main" {
+  name_prefix   = "${var.app_name}-"
+  image_id      = var.ami_id
+  instance_type = var.instance_type
 
-  tags = {
-    Name = "${var.app_name}-logs"
-  }
-}
+  vpc_security_group_ids = [aws_security_group.ec2.id]
 
-# ECS Cluster
-resource "aws_ecs_cluster" "main" {
-  name = "${var.app_name}-cluster"
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              set -e
+              
+              # Actualizar el sistema
+              yum update -y
+              
+              # Instalar Docker si no está instalado
+              if ! command -v docker &> /dev/null; then
+                amazon-linux-extras install docker -y
+              fi
+              
+              # Instalar Docker Compose
+              if ! command -v docker-compose &> /dev/null; then
+                curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+                chmod +x /usr/local/bin/docker-compose
+              fi
+              
+              # Iniciar el servicio Docker
+              systemctl start docker
+              systemctl enable docker
+              
+              # Agregar usuario ec2-user al grupo docker
+              usermod -aG docker ec2-user
+              
+              # Crear directorio para la aplicación
+              mkdir -p /home/ec2-user/app
+              cd /home/ec2-user/app
+              
+              # Obtener la imagen desde ECR y ejecutarla
+              docker run -d --restart always -p ${var.app_port}:${var.app_port} \
+                --name react-app \
+                IMAGEN_ECR_AQUI:latest
+              
+              EOF
+  )
 
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-
-  tags = {
-    Name = "${var.app_name}-cluster"
-  }
-}
-
-resource "aws_ecs_cluster_capacity_providers" "main" {
-  cluster_name = aws_ecs_cluster.main.name
-
-  capacity_providers = ["FARGATE", "FARGATE_SPOT"]
-
-  default_capacity_provider_strategy {
-    base              = 1
-    weight            = 100
-    capacity_provider = "FARGATE"
-  }
-}
-
-# ECS Task Definition
-resource "aws_ecs_task_definition" "main" {
-  family                   = var.app_name
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
-
-  container_definitions = jsonencode([
-    {
-      name      = var.app_name
-      image     = var.container_image
-      essential = true
-      portMappings = [
-        {
-          containerPort = var.container_port
-          hostPort      = var.container_port
-          protocol      = "tcp"
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.app_name}-instance"
     }
-  ])
+  }
 
-  tags = {
-    Name = "${var.app_name}-task-def"
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
-# ECS Service
-resource "aws_ecs_service" "main" {
-  name            = "${var.app_name}-service"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.main.arn
-  desired_count   = 2
-  launch_type     = "FARGATE"
+# Auto Scaling Group
+resource "aws_autoscaling_group" "main" {
+  name                = "${var.app_name}-asg"
+  vpc_zone_identifier = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+  target_group_arns   = [aws_lb_target_group.main.arn]
+  health_check_type   = "ELB"
+  health_check_grace_period = 300
 
-  network_configuration {
-    subnets          = [aws_subnet.public_1.id, aws_subnet.public_2.id]
-    security_groups  = [aws_security_group.ecs.id]
-    assign_public_ip = true
+  min_size         = var.min_size
+  max_size         = var.max_size
+  desired_capacity = var.desired_capacity
+
+  launch_template {
+    id      = aws_launch_template.main.id
+    version = "$Latest"
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.main.arn
-    container_name   = var.app_name
-    container_port   = var.container_port
+  tag {
+    key                 = "Name"
+    value               = "${var.app_name}-asg-instance"
+    propagate_at_launch = true
   }
 
-  depends_on = [aws_lb_listener.main]
-
-  tags = {
-    Name = "${var.app_name}-service"
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
-# IAM Role para ECS Task Execution
-resource "aws_iam_role" "ecs_task_execution_role" {
-  name = "${var.app_name}-ecs-task-execution-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ecs-tasks.amazonaws.com"
-        }
-      }
-    ]
-  })
+# Política de escalado automático (Scale Up)
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "${var.app_name}-scale-up"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.main.name
 }
 
-resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
-  role       = aws_iam_role.ecs_task_execution_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+# Política de escalado automático (Scale Down)
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "${var.app_name}-scale-down"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.main.name
+}
+
+# CloudWatch Alarm para Scale Up
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "${var.app_name}-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 70
+  alarm_description   = "Escala hacia arriba cuando el CPU > 70%"
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.main.name
+  }
+}
+
+# CloudWatch Alarm para Scale Down
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "${var.app_name}-cpu-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 30
+  alarm_description   = "Escala hacia abajo cuando el CPU < 30%"
+  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.main.name
+  }
 }
 
 # Outputs
 output "alb_dns_name" {
-  description = "DNS name of the ALB"
+  description = "DNS name del Application Load Balancer"
   value       = aws_lb.main.dns_name
 }
 
-output "ecs_cluster_name" {
-  description = "ECS Cluster name"
-  value       = aws_ecs_cluster.main.name
+output "alb_arn" {
+  description = "ARN del ALB"
+  value       = aws_lb.main.arn
 }
 
-output "ecs_service_name" {
-  description = "ECS Service name"
-  value       = aws_ecs_service.main.name
+output "autoscaling_group_name" {
+  description = "Nombre del Auto Scaling Group"
+  value       = aws_autoscaling_group.main.name
+}
+
+output "launch_template_id" {
+  description = "ID del Launch Template"
+  value       = aws_launch_template.main.id
+}
+
+output "vpc_id" {
+  description = "ID de la VPC"
+  value       = aws_vpc.main.id
 }
