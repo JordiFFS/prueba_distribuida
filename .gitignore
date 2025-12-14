@@ -1,4 +1,6 @@
+# =====================
 # Logs
+# =====================
 logs/
 *.log
 npm-debug.log*
@@ -7,19 +9,27 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# =====================
 # Node
+# =====================
 node_modules/
 dist/
 dist-ssr/
 *.local
 
+# =====================
 # Terraform
+# =====================
 terraform/.terraform/
 terraform/*.tfstate
-terraform/*.tfstate.backup
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/tfplan
 terraform/.terraform.lock.hcl
 
-# Editors
+# =====================
+# Editors / OS
+# =====================
 .vscode/*
 !.vscode/extensions.json
 .idea/
